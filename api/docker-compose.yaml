@@ -1,7 +1,9 @@
 version: "3.8"
+
 services:
   db:
-    image: mysql
+    image: mysql:8
+    container_name: tlc-mysql
     ports:
       - "3306:3306"
     environment:
@@ -9,14 +11,75 @@ services:
       - MYSQL_DATABASE=tlc
       - MYSQL_USER=tlc
       - MYSQL_PASSWORD=tlc
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   etherpad:
-    image: etherpad/etherpad
+    image: etherpad/etherpad:latest
+    container_name: tlc-etherpad
     ports:
       - "9001:9001"
     volumes:
-      - ./APIKEY.txt:/opt/etherpad-lite/APIKEY.txt
+      - ./APIKEY.txt:/opt/etherpad-lite/APIKEY.txt:ro
+
   mail:
     image: bytemark/smtp
+    container_name: tlc-smtp
     restart: always
     ports:
       - "2525:25"
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: tlc-jaeger
+    ports:
+      - "16686:16686"   # UI Jaeger
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    container_name: tlc-otelcol
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4319:4318"   # OTLP HTTP (navigateur -> collector depuis le host)
+      - "4320:4317"   # OTLP gRPC (optionnel)
+    depends_on:
+      - jaeger
+
+  api:
+    image: tlc/api:local
+    container_name: tlc-api
+    depends_on:
+      db:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    environment:
+      # --- OpenTelemetry (mets-le en pause le temps de vérifier que l'app démarre) ---
+      # - JAVA_TOOL_OPTIONS=-javaagent:/otel/opentelemetry-javaagent.jar
+      - OTEL_SERVICE_NAME=api-java
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_TRACES_SAMPLER=always_on
+      - OTEL_RESOURCE_ATTRIBUTES=service.version=1.0.0,deployment.environment=dev
+
+      # --- Datasource (Quarkus) ---
+      - QUARKUS_DATASOURCE_JDBC_URL=jdbc:mysql://db:3306/tlc?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      - QUARKUS_DATASOURCE_USERNAME=tlc
+      - QUARKUS_DATASOURCE_PASSWORD=tlc
+    # Pas de volumes pour ./target, pas de working_dir, pas de command :
+    # l'ENTRYPOINT de l'image Quarkus lance déjà /deployments/quarkus-run.jar
+
+
+volumes:
+  db_data:
